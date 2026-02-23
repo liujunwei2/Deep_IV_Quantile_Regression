@@ -1,0 +1,736 @@
+# ============================================================
+# Deep IV Quantile Regression via Conditional Diffusion (PyTorch)
+# Single-file Colab runnable code
+# ============================================================
+
+import math, time, random
+from dataclasses import dataclass
+from typing import Dict, Tuple, Callable, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ----------------------------
+# Utils
+# ----------------------------
+
+def set_seed(seed: int = 0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def to_device(x, device):
+    if isinstance(x, torch.Tensor):
+        return x.to(device)
+    return torch.tensor(x, device=device)
+
+def robust_stats(x: np.ndarray) -> Dict[str, float]:
+    # RobustMSE = (median_bias)^2 + (IQR/1.349)^2
+    med = np.median(x)
+    q25 = np.quantile(x, 0.25)
+    q75 = np.quantile(x, 0.75)
+    iqr = q75 - q25
+    return {"median": float(med), "iqr": float(iqr), "sd_robust": float(iqr / 1.349)}
+
+class Standardizer:
+    """Per-dimension standardization for stable diffusion training."""
+    def __init__(self, eps: float = 1e-6):
+        self.eps = eps
+        self.mean = None
+        self.std = None
+
+    def fit(self, x: torch.Tensor):
+        self.mean = x.mean(dim=0, keepdim=True)
+        self.std = x.std(dim=0, keepdim=True).clamp_min(self.eps)
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+    def inverse(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.std + self.mean
+
+# ----------------------------
+# Smoothed indicator I_h: uniform kernel
+# I_h(v) = clamp(0.5 - v/(2h), 0, 1)
+# ----------------------------
+def I_h_uniform(v: torch.Tensor, h: float) -> torch.Tensor:
+    return torch.clamp(0.5 - v / (2.0 * h), 0.0, 1.0)
+
+# ----------------------------
+# Time embedding (sinusoidal)
+# ----------------------------
+class TimeEmbedding(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        t: (B, 1)
+        return: (B, dim)
+        """
+        half = self.dim // 2
+        freqs = torch.exp(
+            torch.linspace(0, math.log(10000.0), half, device=t.device)
+        )
+        args = t * freqs[None, :]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        if self.dim % 2 == 1:
+            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+        return emb
+
+# ----------------------------
+# Score network b(t, w, z) ~= ∇ log p_t(w|z)
+# ----------------------------
+class ScoreNet(nn.Module):
+    def __init__(self, w_dim: int, z_dim: int, t_dim: int = 64, hidden: int = 256, depth: int = 4):
+        super().__init__()
+        self.t_embed = TimeEmbedding(t_dim)
+
+        in_dim = t_dim + w_dim + z_dim
+        layers = []
+        d = in_dim
+        for _ in range(depth):
+            layers.append(nn.Linear(d, hidden))
+            layers.append(nn.SiLU())
+            d = hidden
+        layers.append(nn.Linear(d, w_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, t: torch.Tensor, w: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        # t: (B,1), w:(B,w_dim), z:(B,z_dim)
+        te = self.t_embed(t)
+        x = torch.cat([te, w, z], dim=-1)
+        return self.net(x)
+
+# ----------------------------
+# f model class: linear or MLP
+# ----------------------------
+class LinearF(nn.Module):
+    def __init__(self, x_dim: int):
+        super().__init__()
+        self.lin = nn.Linear(x_dim, 1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lin(x).squeeze(-1)
+
+class MLPF(nn.Module):
+    def __init__(self, x_dim: int, hidden: int = 256, depth: int = 3):
+        super().__init__()
+        layers = []
+        d = x_dim
+        for _ in range(depth):
+            layers.append(nn.Linear(d, hidden))
+            layers.append(nn.SiLU())
+            d = hidden
+        layers.append(nn.Linear(d, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+# ----------------------------
+# OU schedule helpers
+# ----------------------------
+def m_t(t: torch.Tensor) -> torch.Tensor:
+    return torch.exp(-t)
+
+def sigma_t(t: torch.Tensor) -> torch.Tensor:
+    # sqrt(1 - e^{-2t})
+    return torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * t), min=1e-8))
+
+# ============================================================
+# DGPs (from your txt notes)
+# ============================================================
+
+def _mix_scale(n: int, pi0: float, sigma2: float, device: str) -> torch.Tensor:
+    # S ∈ {1, sigma2}
+    u = torch.rand(n, device=device)
+    S = torch.where(u < pi0, torch.full((n,), sigma2, device=device), torch.ones(n, device=device))
+    return S
+
+def dgp_sel_iv1(
+    n: int,
+    tau: float,
+    beta0: float = 1.0,
+    gamma1: float = 0.0,
+    gamma2: float = 0.0,
+    pi: float = 1.0,
+    pi0: float = 0.1,
+    sigma2: float = 9.0,
+    rho: float = 0.5,
+    device: str = "cpu"
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+    """
+    DGP-SEL-IV1: thick tail via bounded-scale Gaussian mixture
+    Steps match your note: S-mixture, correlated (V1,V2), U=V1-beta0 V2, then U^o=U-Q_tau(U):contentReference[oaicite:5]{index=5}
+    """
+    Z = torch.randn(n, 1, device=device)
+
+    S = _mix_scale(n, pi0, sigma2, device)  # (n,)
+    # (tildeV1, tildeV2) | S ~ N(0, S I2)
+    tilde = torch.randn(n, 2, device=device) * torch.sqrt(S)[:, None]
+    tildeV1 = tilde[:, 0]
+    tildeV2 = tilde[:, 1]
+    V1 = tildeV1
+    V2 = math.sqrt(1 - rho**2) * tildeV2 + rho * tildeV1
+
+    X = gamma2 + pi * Z.squeeze(-1) + V2
+    U = V1 - beta0 * V2
+
+    # calibrate quantile: U^o = U - Q_tau(U)
+    c_tau = torch.quantile(U, torch.tensor(tau, device=device))
+    Uo = U - c_tau
+
+    Y = gamma1 + beta0 * X + Uo
+
+    x = X[:, None]           # (n,1)
+    y = Y[:, None]           # (n,1)
+    z = Z                    # (n,1)
+    info = {"beta_true": beta0, "x_dim": 1, "z_dim": 1}
+    return x, y, z, info
+
+def dgp_sel_iv2(
+    n: int,
+    tau: float,
+    beta0: float = 1.0,
+    gamma1: float = 0.0,
+    gamma2: float = 0.0,
+    pi: float = 1.0,
+    a: float = 0.25,
+    pi0: float = 0.1,
+    sigma2: float = 9.0,
+    rho: float = 0.2,
+    device: str = "cpu"
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+    """
+    DGP-SEL-IV2: heteroskedastic U^o = sigma(V2)*E^o, with sigma(v)=a*(1+|v|) and E^o has tau-quantile 0:contentReference[oaicite:6]{index=6}
+    """
+    Z = torch.randn(n, 1, device=device)
+
+    # V2 from bounded-scale mixture (or simplify to N(0,1))
+    S = _mix_scale(n, pi0, sigma2, device)
+    tilde = torch.randn(n, 2, device=device) * torch.sqrt(S)[:, None]
+    tildeV1 = tilde[:, 0]
+    tildeV2 = tilde[:, 1]
+    V2 = math.sqrt(1 - rho**2) * tildeV2 + rho * tildeV1
+
+    X = gamma2 + pi * Z.squeeze(-1) + V2
+
+    # E^o = E - Phi^{-1}(tau) so P(E^o<=0)=tau
+    normal = torch.distributions.Normal(0.0, 1.0)
+    qtau = normal.icdf(torch.tensor(tau, device=device))
+    E = torch.randn(n, device=device)
+    Eo = E - qtau
+
+    sigma = a * (1.0 + torch.abs(V2))
+    Uo = sigma * Eo
+
+    Y = gamma1 + beta0 * X + Uo
+
+    x = X[:, None]
+    y = Y[:, None]
+    z = Z
+    info = {"beta_true": beta0, "x_dim": 1, "z_dim": 1}
+    return x, y, z, info
+
+def dgp_sel_iv3(
+    n: int,
+    tau: float,
+    beta0: float = 1.0,
+    gamma1: float = 0.0,
+    gamma2: float = 0.0,
+    pi: float = 1.0,
+    omega: float = 0.25,
+    mu1: float = -0.5,
+    mu2: float = 1.5,
+    lam: float = 0.8,
+    pi0: float = 0.1,
+    sigma2: float = 4.0,
+    rho: float = 0.2,
+    device: str = "cpu"
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+    """
+    DGP-SEL-IV3: skew via shifted Gaussian mixture E, then U raw = E^o + lam V2 (endogeneity)
+    Note: your note writes U^o:=E^o+lam V2:contentReference[oaicite:7]{index=7}.
+    To enforce P(U^o<=0)=tau, we re-center U_raw by its tau-quantile (same calibration idea as IV1).
+    """
+    Z = torch.randn(n, 1, device=device)
+
+    # V2: mixture-scale Gaussian
+    S = _mix_scale(n, pi0, sigma2, device)
+    tilde = torch.randn(n, 2, device=device) * torch.sqrt(S)[:, None]
+    tildeV1 = tilde[:, 0]
+    tildeV2 = tilde[:, 1]
+    V2 = math.sqrt(1 - rho**2) * tildeV2 + rho * tildeV1
+
+    X = gamma2 + pi * Z.squeeze(-1) + V2
+
+    # skewed E: mixture normal
+    u = torch.rand(n, device=device)
+    E = torch.where(
+        u < omega,
+        torch.randn(n, device=device) + mu2,
+        torch.randn(n, device=device) + mu1
+    )
+    c_tau_E = torch.quantile(E, torch.tensor(tau, device=device))
+    Eo = E - c_tau_E  # P(Eo<=0)=tau
+
+    U_raw = Eo + lam * V2
+    c_tau_U = torch.quantile(U_raw, torch.tensor(tau, device=device))
+    Uo = U_raw - c_tau_U  # enforce P(Uo<=0)=tau
+
+    Y = gamma1 + beta0 * X + Uo
+
+    x = X[:, None]
+    y = Y[:, None]
+    z = Z
+    info = {"beta_true": beta0, "x_dim": 1, "z_dim": 1}
+    return x, y, z, info
+
+def dgp_highdim_iib(
+    n: int,
+    tau: float,
+    p: int = 10,
+    d_exo: int = 200,
+    s: int = 5,
+    beta1: float = 1.0,
+    beta2: float = -0.5,
+    alpha: float = 0.0,
+    pi0: float = 0.1,
+    sigma2: float = 9.0,
+    rho1: float = 0.5,
+    rho2: float = 0.5,
+    device: str = "cpu"
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+    """
+    High-dimensional II-B DGP (sparse exo + multi endogenous + multi instruments):contentReference[oaicite:8]{index=8}
+    Z ~ N(0, I_p)
+    X_exo ~ N(0, I_dexo), independent
+    D1 = a1^T Z + eta1, D2 = a2^T Z + eta2
+    Y = alpha + beta1 D1 + beta2 D2 + X_exo^T theta + U^o, with Q_tau(U^o|Z)=0 via calibration
+    """
+    Z = torch.randn(n, p, device=device)
+    Xexo = torch.randn(n, d_exo, device=device)
+
+    # choose dense a1,a2 (could be sparse too)
+    a1 = torch.randn(p, device=device) / math.sqrt(p)
+    a2 = torch.randn(p, device=device) / math.sqrt(p)
+
+    # correlated (eta1, eta2, U) via mixture scale + Cholesky
+    # correlation matrix:
+    Corr = torch.tensor([
+        [1.0, 0.0, rho1],
+        [0.0, 1.0, rho2],
+        [rho1, rho2, 1.0],
+    ], device=device)
+    # ensure PSD by small jitter if needed
+    Corr = Corr + 1e-6 * torch.eye(3, device=device)
+    L = torch.linalg.cholesky(Corr)
+
+    S = _mix_scale(n, pi0, sigma2, device)  # (n,)
+    G = torch.randn(n, 3, device=device)
+    E = (G @ L.T) * torch.sqrt(S)[:, None]
+    eta1 = E[:, 0]
+    eta2 = E[:, 1]
+    U = E[:, 2]
+
+    D1 = Z @ a1 + eta1
+    D2 = Z @ a2 + eta2
+
+    # sparse theta
+    theta = torch.zeros(d_exo, device=device)
+    support = torch.randperm(d_exo, device=device)[:s]
+    theta[support] = torch.randn(s, device=device)
+
+    # calibrate U^o to have tau-quantile 0 (unconditional, and independent of Z by construction)
+    c_tau = torch.quantile(U, torch.tensor(tau, device=device))
+    Uo = U - c_tau
+
+    Y = alpha + beta1 * D1 + beta2 * D2 + (Xexo @ theta) + Uo
+
+    X = torch.cat([D1[:, None], D2[:, None], Xexo], dim=1)  # (n, 2+d_exo)
+    x = X
+    y = Y[:, None]
+    z = Z
+    info = {
+        "beta_true": (beta1, beta2, theta.detach().cpu().numpy(), support.detach().cpu().numpy()),
+        "x_dim": x.shape[1],
+        "z_dim": p,
+        "support": support.detach().cpu().numpy()
+    }
+    return x, y, z, info
+
+# ============================================================
+# Conditional diffusion training (Algorithm 2)
+# ============================================================
+
+@dataclass
+class DiffusionConfig:
+    T0: float = 0.05
+    T: float = 1.5
+    steps: int = 2000
+    batch_size: int = 256
+    lr: float = 2e-4
+    grad_clip: float = 1.0
+    t_dim: int = 64
+    hidden: int = 256
+    depth: int = 4
+
+@dataclass
+class SampleConfig:
+    K: int = 64  # Euler steps
+    m: int = 64  # MC samples per z
+    chunk_z: int = 256  # z-batch during sampling
+
+def train_score_model(
+    w0: torch.Tensor,
+    z: torch.Tensor,
+    cfg: DiffusionConfig,
+    device: str
+) -> Tuple[ScoreNet, Standardizer, Standardizer]:
+    """
+    Train b(t,w,z) by denoising score matching for OU:
+      w_t = m_t w0 + sigma_t U, U~N(0,I)
+      loss = || b(t,w_t,z) + U/sigma_t ||^2
+    """
+    assert w0.ndim == 2 and z.ndim == 2
+    n, w_dim = w0.shape
+    z_dim = z.shape[1]
+
+    # standardize
+    w_scaler = Standardizer()
+    z_scaler = Standardizer()
+    w_scaler.fit(w0)
+    z_scaler.fit(z)
+
+    w0s = w_scaler.transform(w0)
+    zs = z_scaler.transform(z)
+
+    model = ScoreNet(w_dim=w_dim, z_dim=z_dim, t_dim=cfg.t_dim, hidden=cfg.hidden, depth=cfg.depth).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+
+    idx = torch.arange(n, device=device)
+
+    model.train()
+    for step in range(1, cfg.steps + 1):
+        bsz = min(cfg.batch_size, n)
+        batch_idx = idx[torch.randint(0, n, (bsz,), device=device)]
+        w0b = w0s[batch_idx]
+        zb = zs[batch_idx]
+
+        # sample times uniformly on [T0, T]
+        t = (cfg.T0 + (cfg.T - cfg.T0) * torch.rand(bsz, 1, device=device))
+        mt = m_t(t)
+        st = sigma_t(t)
+
+        U = torch.randn(bsz, w_dim, device=device)
+        wt = mt * w0b + st * U
+
+        pred = model(t, wt, zb)
+        target = - U / st  # shape (B,w_dim)
+        loss = (pred - target).pow(2).mean()
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        if cfg.grad_clip is not None and cfg.grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        opt.step()
+
+        if step % max(100, cfg.steps // 10) == 0:
+            print(f"[score train] step {step:5d}/{cfg.steps}  loss={loss.item():.6f}")
+
+    return model.eval(), w_scaler, z_scaler
+
+@torch.no_grad()
+def sample_from_model(
+    model: ScoreNet,
+    z_cond: torch.Tensor,
+    w_scaler: Standardizer,
+    z_scaler: Standardizer,
+    diff_cfg: DiffusionConfig,
+    samp_cfg: SampleConfig,
+    device: str
+) -> torch.Tensor:
+    """
+    Euler–Maruyama sampling for reverse SDE (paper eq. (13)):
+      W_{i+1} = W_i + dt*(W_i + 2 b(T - t_i, W_i, z)) + sqrt(2 dt) * eps
+    Start W_0 ~ N(0,I).
+    Returns samples in ORIGINAL (unstandardized) coordinates, shape (B, m, w_dim).
+    """
+    z_cond = z_cond.to(device)
+    B = z_cond.shape[0]
+    z_dim = z_cond.shape[1]
+    assert z_dim == z_scaler.mean.shape[1]
+
+    # standardize z
+    zs = z_scaler.transform(z_cond)
+
+    K = samp_cfg.K
+    m = samp_cfg.m
+    dt = (diff_cfg.T - diff_cfg.T0) / K
+
+    # expand z to (B*m, z_dim)
+    zs_big = zs.repeat_interleave(m, dim=0)  # (B*m, z_dim)
+
+    # init W0 ~ N(0,I) in standardized w-space
+    w_dim = w_scaler.mean.shape[1]
+    W = torch.randn(B * m, w_dim, device=device)
+
+    # iterate t from 0 to T-T0
+    # score input time is (T - t_i) in [T0, T]
+    for i in range(K):
+        t_i = (i * dt)
+        t_in = torch.full((B * m, 1), diff_cfg.T - t_i, device=device)  # (B*m,1)
+        b = model(t_in, W, zs_big)  # (B*m, w_dim)
+        drift = W + 2.0 * b
+        noise = torch.randn_like(W)
+        W = W + dt * drift + math.sqrt(2.0 * dt) * noise
+
+    # reshape and inverse standardize w
+    W = W.view(B, m, w_dim)
+    W_orig = w_scaler.inverse(W.view(B * m, w_dim)).view(B, m, w_dim)
+    return W_orig
+
+# ============================================================
+# Algorithm 1: estimate f via smoothed conditional moment ERM
+# ============================================================
+
+@dataclass
+class EstimatorConfig:
+    h: float = 0.5
+    f_kind: str = "linear"  # "linear" or "mlp"
+    f_lr: float = 2e-3
+    f_steps: int = 1500
+    batch_z: int = 128
+    l2: float = 0.0
+    l1: float = 0.0  # for highdim sparse linear
+    print_every: int = 200
+
+def fit_f_via_erm(
+    x_obs: torch.Tensor,
+    y_obs: torch.Tensor,
+    z_obs: torch.Tensor,
+    tau: float,
+    model: ScoreNet,
+    w_scaler: Standardizer,
+    z_scaler: Standardizer,
+    diff_cfg: DiffusionConfig,
+    samp_cfg: SampleConfig,
+    est_cfg: EstimatorConfig,
+    device: str
+) -> nn.Module:
+    """
+    Minimize empirical loss over z_j:
+      L = (1/n) sum_j | (1/m) sum_i I_h( yhat_{i,zj} - f(xhat_{i,zj}) ) - tau |^2
+    We sample on-the-fly for each minibatch of z_j to avoid huge caching in high-dim.
+    """
+    n = z_obs.shape[0]
+    x_dim = x_obs.shape[1]
+
+    if est_cfg.f_kind == "linear":
+        f = LinearF(x_dim).to(device)
+    else:
+        f = MLPF(x_dim, hidden=256, depth=3).to(device)
+
+    opt = torch.optim.AdamW(f.parameters(), lr=est_cfg.f_lr)
+
+    idx = torch.arange(n)
+    z_obs_cpu = z_obs.detach().cpu()
+    # (x_obs,y_obs) not directly used in ERM (we use diffusion samples), but kept for potential diagnostics.
+
+    f.train()
+    model.eval()
+
+    for step in range(1, est_cfg.f_steps + 1):
+        # sample a batch of z_j
+        bsz = min(est_cfg.batch_z, n)
+        batch_idx = idx[torch.randint(0, n, (bsz,))]
+        z_b = z_obs_cpu[batch_idx].to(device)
+
+        # sample (xhat, yhat) from learned conditional
+        W = sample_from_model(
+            model=model, z_cond=z_b,
+            w_scaler=w_scaler, z_scaler=z_scaler,
+            diff_cfg=diff_cfg, samp_cfg=samp_cfg, device=device
+        )  # (B, m, w_dim=d+1)
+
+        # split
+        # W = (x, y) where w_dim = x_dim + 1
+        x_hat = W[:, :, :x_dim].contiguous()         # (B,m,x_dim)
+        y_hat = W[:, :, x_dim].contiguous()          # (B,m)
+
+        # compute T_hat f(z_j)
+        # f(x_hat): (B,m)
+        fx = f(x_hat.view(-1, x_dim)).view(bsz, samp_cfg.m)
+        Ih = I_h_uniform(y_hat - fx, est_cfg.h)      # (B,m)
+        T_hat = Ih.mean(dim=1)                       # (B,)
+        loss = (T_hat - tau).pow(2).mean()
+
+        # add optional regularizers
+        if est_cfg.l2 > 0:
+            l2_term = sum((p.pow(2).sum() for p in f.parameters()))
+            loss = loss + est_cfg.l2 * l2_term
+        if est_cfg.l1 > 0 and est_cfg.f_kind == "linear":
+            l1_term = f.lin.weight.abs().sum()
+            loss = loss + est_cfg.l1 * l1_term
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        if step % est_cfg.print_every == 0 or step == 1:
+            print(f"[f ERM] step {step:5d}/{est_cfg.f_steps}  loss={loss.item():.6f}")
+
+    return f.eval()
+
+# ============================================================
+# Evaluation helpers
+# ============================================================
+
+@torch.no_grad()
+def coverage_rate(y: torch.Tensor, x: torch.Tensor, f: nn.Module, tau: float, device: str) -> float:
+    fx = f(x.to(device)).detach().cpu().numpy()
+    yv = y.detach().cpu().numpy().squeeze(-1)
+    return float(np.mean(yv <= fx))
+
+@torch.no_grad()
+def get_linear_beta(f: LinearF) -> Tuple[np.ndarray, float]:
+    w = f.lin.weight.detach().cpu().numpy().reshape(-1)
+    b = float(f.lin.bias.detach().cpu().numpy().reshape(-1)[0])
+    return w, b
+
+# ============================================================
+# Main runner
+# ============================================================
+
+from dataclasses import dataclass, field
+
+@dataclass
+class RunConfig:
+    exp_name: str = "sel_iv1"     # "sel_iv1" | "sel_iv2" | "sel_iv3" | "highdim_iib"
+    seed: int = 0
+    n: int = 2000
+    tau: float = 0.5
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # IMPORTANT: use default_factory for dataclass fields
+    diff: DiffusionConfig = field(default_factory=DiffusionConfig)
+    samp: SampleConfig = field(default_factory=SampleConfig)
+    est: EstimatorConfig = field(default_factory=EstimatorConfig)
+
+def make_data(run: RunConfig) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+    device = run.device
+    if run.exp_name == "sel_iv1":
+        return dgp_sel_iv1(n=run.n, tau=run.tau, beta0=1.0, pi=1.0, device=device)
+    if run.exp_name == "sel_iv2":
+        return dgp_sel_iv2(n=run.n, tau=run.tau, beta0=1.0, pi=1.0, device=device)
+    if run.exp_name == "sel_iv3":
+        return dgp_sel_iv3(n=run.n, tau=run.tau, beta0=1.0, pi=1.0, device=device)
+    if run.exp_name == "highdim_iib":
+        # smaller n for feasibility on colab; increase carefully
+        return dgp_highdim_iib(n=run.n, tau=run.tau, p=10, d_exo=200, s=5, device=device)
+    raise ValueError(f"Unknown exp_name={run.exp_name}")
+
+def run_once(run: RunConfig):
+    set_seed(run.seed)
+    device = run.device
+    print("Device:", device)
+    print("Experiment:", run.exp_name, "n=", run.n, "tau=", run.tau)
+
+    # data
+    x, y, z, info = make_data(run)
+    x_dim = x.shape[1]
+    z_dim = z.shape[1]
+    print(f"Shapes: x {tuple(x.shape)}, y {tuple(y.shape)}, z {tuple(z.shape)}")
+
+    # build w0 = (x,y)
+    w0 = torch.cat([x, y], dim=1)   # (n, x_dim+1)
+
+    # train diffusion score model
+    t0 = time.time()
+    score_model, w_scaler, z_scaler = train_score_model(w0=w0, z=z, cfg=run.diff, device=device)
+    print(f"Score model trained. elapsed={time.time()-t0:.1f}s")
+
+    # fit f via ERM
+    t1 = time.time()
+    fhat = fit_f_via_erm(
+        x_obs=x, y_obs=y, z_obs=z, tau=run.tau,
+        model=score_model, w_scaler=w_scaler, z_scaler=z_scaler,
+        diff_cfg=run.diff, samp_cfg=run.samp, est_cfg=run.est,
+        device=device
+    )
+    print(f"f fitted. elapsed={time.time()-t1:.1f}s")
+
+    # basic diagnostics: coverage on observed data (not oracle)
+    cov = coverage_rate(y=y, x=x, f=fhat, tau=run.tau, device=device)
+    print(f"Empirical coverage on observed data: {cov:.4f} (target tau={run.tau})")
+
+    # if linear, print coefficients
+    if isinstance(fhat, LinearF):
+        w, b = get_linear_beta(fhat)
+        print("Estimated linear coef (w):", w[:10], " ...")
+        print("Estimated intercept (b):", b)
+
+        # for 1D SEL DGPs, beta_true is slope
+        if run.exp_name.startswith("sel_iv"):
+            beta_true = info["beta_true"]
+            print(f"True slope beta0={beta_true}")
+            print(f"Slope error: {w[0]-beta_true:+.6f}")
+
+        if run.exp_name == "highdim_iib":
+            beta1_true, beta2_true, theta_true, supp = info["beta_true"]
+            print(f"True beta1={beta1_true}, beta2={beta2_true}")
+            print(f"Estimated beta1={w[0]:.6f}, beta2={w[1]:.6f}")
+
+    return fhat, score_model, (x, y, z, info)
+
+# ============================================================
+# Quick Colab config (edit here)
+# ============================================================
+
+CONFIG = RunConfig(
+    exp_name="sel_iv1",  # change to "sel_iv2", "sel_iv3", "highdim_iib"
+    seed=0,
+    n=2000,              # try 2000 first; increase later
+    tau=0.5,
+)
+
+# Diffusion hyperparams (make smaller if you want faster)
+CONFIG.diff = DiffusionConfig(
+    T0=0.05,
+    T=1.5,
+    steps=1500,          # increase for better quality
+    batch_size=256,
+    lr=2e-4,
+    grad_clip=1.0,
+    t_dim=64,
+    hidden=256,
+    depth=4
+)
+
+# Sampling hyperparams
+CONFIG.samp = SampleConfig(
+    K=64,                # Euler steps
+    m=64,                # MC samples per z in ERM
+    chunk_z=256
+)
+
+# ERM hyperparams
+# h: smoothing bandwidth in I_h; can tune
+CONFIG.est = EstimatorConfig(
+    h=0.5,               # try 0.2~1.0 depending on scale of y
+    f_kind="linear",     # "linear" or "mlp"
+    f_lr=2e-3,
+    f_steps=1200,
+    batch_z=128,
+    l2=0.0,
+    l1=0.0,              # for highdim_iib you can try l1=1e-4 with linear
+    print_every=200
+)
+
+# Run
+_ = run_once(CONFIG)
