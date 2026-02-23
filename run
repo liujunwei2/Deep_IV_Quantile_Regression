@@ -1,3 +1,4 @@
+#实验二
 CONFIG = RunConfig(exp_name="sel_iv2", seed=0, n=2000, tau=0.5)
 
 # 推荐：异方差下 y 的尺度更不均匀，h 可以稍大一点更稳
@@ -13,7 +14,7 @@ CONFIG.est = EstimatorConfig(
 
 _ = run_once(CONFIG)
 
-
+#实验三
 CONFIG = RunConfig(exp_name="sel_iv3", seed=0, n=2000, tau=0.5)
 
 # 偏态下 I_h 的平滑偏差可能更敏感，先用中等 h
@@ -29,7 +30,7 @@ CONFIG.est = EstimatorConfig(
 
 _ = run_once(CONFIG)
 
-
+#实验四
 CONFIG = RunConfig(exp_name="highdim_iib", seed=0, n=1500, tau=0.5)
 
 CONFIG.samp = SampleConfig(K=48, m=32, chunk_z=256)
